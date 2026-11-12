@@ -63,7 +63,7 @@ npm --version
 
 1. Clone or download this repository:
    ```bash
-   git clone https://github.com/yourusername/n8n-backup-and-upgrade-npm.git
+   git clone https://github.com/bonkas/n8n-backup-and-upgrade-npm.git
    cd n8n-backup-and-upgrade-npm
    ```
 
