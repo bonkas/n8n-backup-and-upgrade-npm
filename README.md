@@ -2,6 +2,11 @@
 
 A bash script that automates the backup and upgrade process for [n8n](https://n8n.io/) workflow automation instances installed globally via npm and managed with systemd.
 
+> **n8n 3.0 notice:** n8n 3.0 drops npm as a supported install method (see the
+> [v3.0 breaking changes](https://docs.n8n.io/changelog/v30-breaking-changes)), so the npm
+> upgrade script stops being useful at 2.x. Use `n8n_migrate_to_docker.sh`
+> ([details below](#migrating-to-docker-n8n-30)) to move an existing npm/systemd install to Docker Compose.
+
 ## Why This Script?
 
 Upgrading n8n installed via npm can be error-prone. Common issues include:
@@ -232,6 +237,58 @@ du -sh ./n8n_backup/*
 # Remove a specific backup
 rm -rf ./n8n_backup/20240101-120000
 ```
+
+## Migrating to Docker (n8n 3.0+)
+
+`n8n_migrate_to_docker.sh` converts a global-npm + systemd install into a Docker Compose deployment.
+It has **not been run against a live server yet** - test it on a snapshot or clone first.
+
+```bash
+chmod +x n8n_migrate_to_docker.sh
+sudo ./n8n_migrate_to_docker.sh
+```
+
+Optional variables: `TARGET_DIR` (default `/opt/n8n`) and `HOST_PORT` (default `5678`).
+
+### Prerequisites
+
+- Docker and the `docker compose` plugin installed
+- `n8n` still installed via npm and managed by `n8n.service`
+
+### What it does
+
+1. Reads `n8n.service` (service user, `Environment=`, `EnvironmentFile=`), the data folder
+   (including `N8N_USER_FOLDER`) and the DB type
+2. Locates the encryption key (env var or `config` file) and aborts if it cannot be found
+3. Stops the service and backs up the unit definition and data folder to
+   `./n8n_backup/migrate-<timestamp>/`
+4. Copies the data folder to `<TARGET_DIR>/n8n_data` (owned by uid/gid 1000, the container's `node` user)
+5. Writes `<TARGET_DIR>/docker-compose.yml` and `.env`, pinning the image to your **current** n8n version
+   and setting `N8N_ENCRYPTION_KEY` explicitly
+6. Disables `n8n.service` (the npm install is left in place for rollback)
+7. Starts the container and checks `/healthz`
+
+For Postgres, the existing database is kept; a loopback `DB_POSTGRESDB_HOST` is rewritten to
+`host.docker.internal`.
+
+### After migrating
+
+1. Verify workflows, credentials and webhooks on the same version
+2. Read the 3.0 breaking changes (e.g. removed Function / Function Item nodes)
+3. Change `N8N_IMAGE_TAG` in `<TARGET_DIR>/.env`, then:
+   ```bash
+   cd /opt/n8n && docker compose pull && docker compose up -d
+   ```
+
+### Rollback
+
+```bash
+docker compose -f /opt/n8n/docker-compose.yml down
+sudo systemctl enable --now n8n.service
+```
+
+Only the environment variables with prefixes `N8N_`, `DB_`, `EXECUTIONS_`, `QUEUE_`, `NODE_FUNCTION_ALLOW`,
+`VUE_APP_` plus `WEBHOOK_URL`, `GENERIC_TIMEZONE` and `TZ` are carried over - check `.env` for anything custom.
 
 ## Security Considerations
 
