@@ -105,7 +105,8 @@ Each backup is stored in `./n8n_backup/<timestamp>/` and includes:
 | Item | Source Location | Backup File |
 |------|-----------------|-------------|
 | n8n installation | `$(npm root -g)/n8n` | `n8n-node-modules.tar.gz` |
-| User data & workflows | `~/.n8n` | `n8n-data.tar.gz` |
+| User data & workflows | auto-detected data folder (often `~/.n8n`) | `n8n-data.tar.gz` |
+| Data folder location | - | `data-dir.txt` |
 | systemd unit file | varies | `systemd/<service-name>` |
 | systemd merged config | - | `systemd/n8n.service.merged.conf` |
 | systemd drop-ins | `/etc/systemd/system/n8n.service.d/` | `systemd/n8n.service.d/` |
@@ -162,7 +163,7 @@ The rollback will:
 3. Stop the n8n service
 4. Remove the current n8n installation
 5. Restore n8n from the backup
-6. Optionally restore user data (`~/.n8n`) - **prompts for confirmation**
+6. Optionally restore user data to the folder recorded in `data-dir.txt` - **prompts for confirmation**
 7. Optionally restore systemd configuration - **prompts for confirmation**
 8. Start the service and verify health
 
@@ -175,6 +176,16 @@ The script uses sensible defaults but can be customized via environment variable
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `N8N_PORT` | `5678` | Port for health check endpoint |
+| `DATA_DIR` | auto-detected | n8n data folder (the one containing `database.sqlite`); also honoured by `n8n_migrate_to_docker.sh` |
+| `SKIP_DATA_BACKUP` | unset | Set to `1` to continue without a data backup if the folder can't be found (e.g. external DB) |
+
+The data folder is detected from the running service (open `database.sqlite` or `N8N_USER_FOLDER`),
+then from `N8N_USER_FOLDER` in the unit, then the service user's home. If it can't be found the script
+**stops before touching n8n** rather than silently skipping the data backup. Find it with:
+
+```bash
+sudo find / -name database.sqlite -path '*n8n*' 2>/dev/null
+```
 
 ### Example with Custom Port
 
@@ -281,6 +292,10 @@ For Postgres, the existing database is kept; a loopback `DB_POSTGRESDB_HOST` is 
    cd /opt/n8n && docker compose pull && docker compose up -d
    ```
 
+The data folder is auto-detected (override with `DATA_DIR=/path/to/.n8n`). Note that inside the container n8n
+runs as the unprivileged `node` user (uid 1000) rather than root, and workflows that call host binaries or
+paths (e.g. Execute Command nodes) will need those mounted or baked into a custom image.
+
 ### Rollback
 
 ```bash
@@ -294,7 +309,7 @@ Only the environment variables with prefixes `N8N_`, `DB_`, `EXECUTIONS_`, `QUEU
 ## Security Considerations
 
 - The script requires **root access** to manage systemd services and global npm packages
-- Backups may contain **sensitive data** including workflow credentials stored in `~/.n8n`
+- Backups may contain **sensitive data** including workflow credentials stored in the n8n data folder
 - Store backups securely and consider encrypting them if they contain sensitive workflows
 - The script does not transmit any data externally
 

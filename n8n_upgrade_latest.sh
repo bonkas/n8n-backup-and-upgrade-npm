@@ -12,7 +12,7 @@ set -euo pipefail
 # Backups include:
 # - systemd unit (merged + source + drop-ins)
 # - global n8n node_modules
-# - n8n user data (~/.n8n)
+# - n8n user data (auto-detected data folder, e.g. ~/.n8n; override with DATA_DIR=)
 # - version metadata
 # - upgrade log
 #
@@ -43,6 +43,38 @@ BACKUP_ROOT="$(pwd)/n8n_backup"
 ############################
 # FUNCTIONS
 ############################
+
+# Locate the n8n data folder (the one holding database.sqlite, config, ...).
+# Order: DATA_DIR env override -> running service (open database.sqlite or
+# N8N_USER_FOLDER in a process env) -> N8N_USER_FOLDER in the unit -> service
+# user's home. Prints the path; returns 1 if nothing exists.
+detect_data_dir() {
+  local d="" cg pid f u svc_user svc_home
+  if [[ -n "${DATA_DIR:-}" ]]; then
+    d="$DATA_DIR"
+  else
+    cg="$(systemctl show -p ControlGroup --value "$SERVICE_NAME" 2>/dev/null || true)"
+    for pid in $(cat "/sys/fs/cgroup${cg}/cgroup.procs" 2>/dev/null || true); do
+      f="$(readlink /proc/"$pid"/fd/* 2>/dev/null | grep -m1 'database\.sqlite' || true)"
+      if [[ -n "$f" ]]; then d="$(dirname "$f")"; break; fi
+      u="$(tr '\0' '\n' < /proc/"$pid"/environ 2>/dev/null | sed -n 's/^N8N_USER_FOLDER=//p' | head -n1 || true)"
+      if [[ -n "$u" && -d "$u/.n8n" ]]; then d="$u/.n8n"; break; fi
+    done
+    if [[ -z "$d" ]]; then
+      u="$(systemctl show -p Environment --value "$SERVICE_NAME" | tr ' ' '\n' | sed -n 's/^N8N_USER_FOLDER=//p' | head -n1 || true)"
+      if [[ -n "$u" ]]; then
+        d="$u/.n8n"
+      else
+        svc_user="$(systemctl show -p User --value "$SERVICE_NAME")"
+        svc_home="$(getent passwd "${svc_user:-root}" | cut -d: -f6)"
+        d="$svc_home/.n8n"
+      fi
+    fi
+  fi
+  [[ -d "$d" ]] || return 1
+  echo "$d"
+}
+
 usage() {
   cat <<EOF
 Usage: $0 [OPTIONS] [VERSION]
@@ -174,7 +206,9 @@ do_rollback() {
 
   # Optionally restore user data
   if [[ -f "$rollback_dir/n8n-data.tar.gz" ]]; then
-    read -r -p "Restore n8n user data (~/.n8n)? This will overwrite current data! [y/N]: " restore_data
+    local saved_dir=""
+    [[ -f "$rollback_dir/data-dir.txt" ]] && saved_dir="$(cat "$rollback_dir/data-dir.txt")"
+    read -r -p "Restore n8n user data (${saved_dir:-original location})? This will overwrite current data! [y/N]: " restore_data
     if [[ "$restore_data" =~ ^[Yy]$ ]]; then
       echo "Restoring n8n user data..."
       tar xzf "$rollback_dir/n8n-data.tar.gz" -C /
@@ -360,9 +394,18 @@ if [[ -d "$NPM_GLOBAL_PATH/n8n" ]]; then
 fi
 
 ### n8n user data
-if [[ -d "$HOME/.n8n" ]]; then
-  echo "Backing up n8n user data..."
-  tar czf "$BACKUP_DIR/n8n-data.tar.gz" "$HOME/.n8n"
+if N8N_DATA_DIR="$(detect_data_dir)"; then
+  echo "Backing up n8n user data from $N8N_DATA_DIR..."
+  tar czf "$BACKUP_DIR/n8n-data.tar.gz" "$N8N_DATA_DIR"
+  echo "$N8N_DATA_DIR" > "$BACKUP_DIR/data-dir.txt"
+elif [[ "${SKIP_DATA_BACKUP:-}" == "1" ]]; then
+  echo "WARNING: n8n data folder not found; continuing WITHOUT a data backup (SKIP_DATA_BACKUP=1)."
+else
+  echo "ERROR: could not find the n8n data folder, so workflows/credentials would NOT be backed up."
+  echo "Find it:  sudo find / -name database.sqlite -path '*n8n*' 2>/dev/null"
+  echo "Then run: sudo DATA_DIR=/path/to/.n8n $0"
+  echo "(or SKIP_DATA_BACKUP=1 if you really do not want a data backup, e.g. external DB)"
+  exit 1
 fi
 
 ### Version metadata

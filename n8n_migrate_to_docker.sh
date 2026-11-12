@@ -111,9 +111,36 @@ done
 get_env() { grep -E "^$1=" "$ENV_RAW" | tail -n1 | cut -d= -f2- || true; }
 
 # Data folder: N8N_USER_FOLDER/.n8n if set, else <home>/.n8n
+# Detect the data folder from the RUNNING service: look for an open
+# database.sqlite file, or N8N_USER_FOLDER / HOME in the process environment.
+detect_runtime_data_dir() {
+  local cg pid f u
+  cg="$(systemctl show -p ControlGroup --value "$SERVICE_NAME")"
+  for pid in $(cat "/sys/fs/cgroup${cg}/cgroup.procs" 2>/dev/null || true); do
+    f="$(readlink /proc/"$pid"/fd/* 2>/dev/null | grep -m1 'database\.sqlite' || true)"
+    if [[ -n "$f" ]]; then dirname "$f"; return; fi
+    u="$(tr '\0' '\n' < /proc/"$pid"/environ 2>/dev/null | sed -n 's/^N8N_USER_FOLDER=//p' | head -n1 || true)"
+    if [[ -n "$u" && -d "$u/.n8n" ]]; then echo "$u/.n8n"; return; fi
+  done
+}
+
 USER_FOLDER="$(get_env N8N_USER_FOLDER)"
-if [[ -n "$USER_FOLDER" ]]; then DATA_DIR="$USER_FOLDER/.n8n"; else DATA_DIR="$SVC_HOME/.n8n"; fi
-[[ -d "$DATA_DIR" ]] || { echo "ERROR: data dir $DATA_DIR not found."; exit 1; }
+if [[ -n "${DATA_DIR:-}" ]]; then
+  echo "Using DATA_DIR from environment: $DATA_DIR"
+else
+  DATA_DIR="$(detect_runtime_data_dir || true)"
+  if [[ -n "$DATA_DIR" ]]; then
+    echo "Detected data folder from running service."
+  elif [[ -n "$USER_FOLDER" ]]; then DATA_DIR="$USER_FOLDER/.n8n"
+  else DATA_DIR="$SVC_HOME/.n8n"
+  fi
+fi
+if [[ ! -d "$DATA_DIR" ]]; then
+  echo "ERROR: data dir '$DATA_DIR' not found."
+  echo "Find it with:  sudo find / -name database.sqlite -path '*n8n*' 2>/dev/null"
+  echo "Then re-run:   sudo DATA_DIR=/path/to/.n8n ./n8n_migrate_to_docker.sh"
+  exit 1
+fi
 echo "n8n data folder: $DATA_DIR"
 
 DB_TYPE="$(get_env DB_TYPE)"
