@@ -252,7 +252,8 @@ Optional variables: `TARGET_DIR` (default `/opt/n8n`) and `HOST_PORT` (default `
 
 ### Prerequisites
 
-- Docker and the `docker compose` plugin installed
+- Docker, the `docker compose` plugin and `curl` - if missing, the script offers to install them
+  (Docker via the official `get.docker.com` script; set `ASSUME_YES=1` to skip the prompt)
 - `n8n` still installed via npm and managed by `n8n.service`
 
 ### What it does

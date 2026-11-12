@@ -19,7 +19,11 @@ set -euo pipefail
 # Upgrade to 3.x afterwards by changing N8N_IMAGE_TAG in /opt/n8n/.env and
 # running: docker compose pull && docker compose up -d
 #
+# Missing requirements (curl, Docker Engine, compose plugin) are installed
+# after a confirmation prompt; set ASSUME_YES=1 to skip the prompt.
+#
 # Usage: sudo ./n8n_migrate_to_docker.sh
+#        sudo ASSUME_YES=1 ./n8n_migrate_to_docker.sh
 ###############################################################################
 
 SERVICE_NAME="n8n.service"
@@ -37,9 +41,49 @@ echo "===== n8n -> Docker migration started $(date) ====="
 # PRE-FLIGHT
 ############################
 [[ $EUID -eq 0 ]] || { echo "ERROR: run as root (sudo)."; exit 1; }
-command -v docker >/dev/null || { echo "ERROR: docker not installed."; exit 1; }
-docker compose version >/dev/null 2>&1 || { echo "ERROR: 'docker compose' plugin not installed."; exit 1; }
 command -v n8n >/dev/null || { echo "ERROR: n8n not found in PATH."; exit 1; }
+
+# --- Install missing requirements (curl, Docker Engine, compose plugin) ---
+install_pkgs() {
+  if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq "$@"
+  elif command -v dnf >/dev/null;   then dnf install -y -q "$@"
+  elif command -v yum >/dev/null;   then yum install -y -q "$@"
+  elif command -v zypper >/dev/null; then zypper --non-interactive install "$@"
+  else echo "ERROR: no supported package manager found; install $* manually."; exit 1
+  fi
+}
+
+NEED=()
+command -v curl >/dev/null || NEED+=(curl)
+command -v docker >/dev/null || NEED+=(docker)
+if command -v docker >/dev/null && ! docker compose version >/dev/null 2>&1; then
+  NEED+=(docker-compose-plugin)
+fi
+
+if (( ${#NEED[@]} )); then
+  echo "Missing requirements: ${NEED[*]}"
+  if [[ "${ASSUME_YES:-}" != "1" ]]; then
+    read -r -p "Install them now? (docker uses Docker's official get.docker.com script) [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborting: requirements not met."; exit 1; }
+  fi
+
+  if [[ " ${NEED[*]} " == *" curl "* ]]; then install_pkgs curl; fi
+
+  if [[ " ${NEED[*]} " == *" docker "* ]]; then
+    # Official Docker convenience script: installs Engine + compose plugin
+    # on Debian/Ubuntu/RHEL-family/Fedora. Downloaded to a file first so it can be inspected.
+    GET_DOCKER="$BACKUP_DIR/get-docker.sh"
+    curl -fsSL https://get.docker.com -o "$GET_DOCKER"
+    sh "$GET_DOCKER"
+  elif [[ " ${NEED[*]} " == *" docker-compose-plugin "* ]]; then
+    install_pkgs docker-compose-plugin
+  fi
+
+  systemctl enable --now docker
+fi
+
+docker compose version >/dev/null 2>&1 || { echo "ERROR: 'docker compose' still unavailable after install."; exit 1; }
+systemctl is-active --quiet docker || systemctl start docker
 [[ ! -e "$TARGET_DIR/docker-compose.yml" ]] || { echo "ERROR: $TARGET_DIR/docker-compose.yml already exists."; exit 1; }
 
 N8N_VERSION="$(n8n --version)"
