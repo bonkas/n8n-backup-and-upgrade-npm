@@ -259,7 +259,9 @@ chmod +x n8n_migrate_to_docker.sh
 sudo ./n8n_migrate_to_docker.sh
 ```
 
-Optional variables: `TARGET_DIR` (default `/opt/n8n`) and `HOST_PORT` (default `5678`).
+Optional variables: `DATA_DIR` (n8n data folder), `TARGET_DIR` (default `/opt/n8n`), `HOST_PORT`
+(default: the service's `N8N_PORT`, else `5678`) and `BIND_ADDR` (e.g. `127.0.0.1` to publish the port only on
+the host's loopback - note Docker-published ports bypass `ufw`/`firewalld`).
 
 ### Prerequisites
 
@@ -303,8 +305,27 @@ docker compose -f /opt/n8n/docker-compose.yml down
 sudo systemctl enable --now n8n.service
 ```
 
-Only the environment variables with prefixes `N8N_`, `DB_`, `EXECUTIONS_`, `QUEUE_`, `NODE_FUNCTION_ALLOW`,
-`VUE_APP_` plus `WEBHOOK_URL`, `GENERIC_TIMEZONE` and `TZ` are carried over - check `.env` for anything custom.
+### Environment variables
+
+**Every** variable defined by the unit (`Environment=` and `EnvironmentFile=`) is copied into `.env`, including
+custom ones (proxy settings, `NODES_EXCLUDE`, ...). Only host-specific ones are skipped (`PATH`, `HOME`, `USER`,
+`SHELL`, `NODE_PATH`, `N8N_USER_FOLDER`, ...). Variable names are printed during the run, never values. Values are
+written single-quoted so `$` in passwords isn't interpolated by Compose.
+
+Things that can't work unchanged in a container are adjusted or listed in a **REVIEW** section (also saved to
+`n8n_backup/migrate-<timestamp>/review.txt`):
+
+| Case | What the script does |
+|------|----------------------|
+| `N8N_PORT` not 5678 | Container listens on it; the host port defaults to the same value |
+| `N8N_LISTEN_ADDRESS` is loopback | Dropped (would make the container unreachable); use `BIND_ADDR=127.0.0.1` instead |
+| `NODES_EXCLUDE` / `NODES_INCLUDE` not a valid JSON array | Dropped with a warning (n8n defaults apply) |
+| `DB_POSTGRESDB_HOST` is localhost | Rewritten to `host.docker.internal` |
+| Variable points at a host **file** (e.g. `NODE_EXTRA_CA_CERTS`) | Mounted read-only at the same path; must be readable by uid 1000 |
+| Variable points at a host **directory** | Flagged - add a volume yourself if needed |
+| Value contains `localhost` / `127.0.0.1` | Flagged - use `host.docker.internal` for host services |
+
+The generated `docker-compose.yml` also rotates container logs (10 MB x 3).
 
 ## Security Considerations
 

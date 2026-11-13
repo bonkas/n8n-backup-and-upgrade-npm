@@ -24,11 +24,18 @@ set -euo pipefail
 #
 # Usage: sudo ./n8n_migrate_to_docker.sh
 #        sudo ASSUME_YES=1 ./n8n_migrate_to_docker.sh
+#
+# Optional variables: DATA_DIR (n8n data folder), TARGET_DIR (default /opt/n8n),
+# HOST_PORT (default: the service's N8N_PORT, else 5678), BIND_ADDR
+# (e.g. 127.0.0.1 to publish only on the host's loopback).
+#
+# ALL variables defined in the unit (Environment= and EnvironmentFile=) are
+# copied into .env, except host-specific ones (PATH, HOME, ...). Anything that
+# cannot work unchanged in a container is flagged in a REVIEW list.
 ###############################################################################
 
 SERVICE_NAME="n8n.service"
 TARGET_DIR="${TARGET_DIR:-/opt/n8n}"
-HOST_PORT="${HOST_PORT:-5678}"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$(pwd)/n8n_backup/migrate-$TIMESTAMP"
 IMAGE="docker.n8n.io/n8nio/n8n"
@@ -184,19 +191,91 @@ cp -a "$DATA_DIR" "$TARGET_DIR/n8n_data"
 # 'node' user inside the official image is uid/gid 1000
 chown -R 1000:1000 "$TARGET_DIR/n8n_data"
 
-# .env: version pin + the service's N8N_/DB_/WEBHOOK_/GENERIC_/TZ vars
+# ---- .env: carry over EVERY variable the service defines (no prefix whitelist),
+# except host-specific ones, adjusting what cannot work unchanged in a container.
+declare -A ENVMAP=()
+ENV_ORDER=()
+REVIEW=()          # things the user should look at (printed + saved)
+EXTRA_VOLUMES=()   # read-only bind mounts for files referenced by variables
+SKIP_RE='^(PATH|HOME|USER|LOGNAME|SHELL|PWD|LANG|LANGUAGE|TERM|NODE_PATH|N8N_USER_FOLDER|N8N_ENCRYPTION_KEY|N8N_IMAGE_TAG|INVOCATION_ID|JOURNAL_STREAM)$'
+DQ='^"(.*)"$'
+SQ="^'(.*)'\$"
+NODES_RE='^\[[[:space:]]*("[^"]*"([[:space:]]*,[[:space:]]*"[^"]*")*)?[[:space:]]*\]$'
+LOOPBACK_RE='(^|[^A-Za-z0-9.])(localhost|127\.0\.0\.1|\[?::1\]?)([^A-Za-z0-9.]|$)'
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  line="${line#export }"
+  [[ "$line" == *=* ]] || continue
+  name="${line%%=*}"
+  value="${line#*=}"
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+  [[ "$name" =~ $SKIP_RE ]] && continue
+  if [[ "$value" =~ $DQ ]]; then value="${BASH_REMATCH[1]}"
+  elif [[ "$value" =~ $SQ ]]; then value="${BASH_REMATCH[1]}"; fi
+
+  case "$name" in
+    N8N_LISTEN_ADDRESS)
+      if [[ "$value" =~ ^(localhost|127\.0\.0\.1|::1)$ ]]; then
+        REVIEW+=("N8N_LISTEN_ADDRESS=$value dropped: loopback-only would make the container unreachable. Use BIND_ADDR=127.0.0.1 to keep it host-local.")
+        continue
+      fi ;;
+    NODES_EXCLUDE|NODES_INCLUDE)
+      if [[ ! "$value" =~ $NODES_RE ]]; then
+        REVIEW+=("$name='$value' dropped: not a valid JSON array of node types (e.g. [\"n8n-nodes-base.executeCommand\"]), so n8n defaults apply. Set it in $TARGET_DIR/.env if you want a specific value ([] = exclude nothing).")
+        continue
+      fi ;;
+    DB_POSTGRESDB_HOST)
+      if [[ "$value" =~ ^(localhost|127\.0\.0\.1|::1)$ ]]; then value="host.docker.internal"; fi ;;
+    *)
+      if [[ "$value" == /* ]]; then
+        case "$value" in
+          /|/proc/*|/sys/*|/dev/*|"$DATA_DIR"|"$DATA_DIR"/*) ;;
+          *)
+            if [[ -f "$value" ]]; then
+              EXTRA_VOLUMES+=("$value:$value:ro")
+              REVIEW+=("$name=$value is a host file: mounted read-only at the same path; make sure it is readable by uid 1000 (the container's 'node' user).")
+            elif [[ -d "$value" ]]; then
+              REVIEW+=("$name=$value is a host directory that does NOT exist in the container; add a volume in $TARGET_DIR/docker-compose.yml if n8n needs it.")
+            fi ;;
+        esac
+      elif [[ "$value" =~ $LOOPBACK_RE ]]; then
+        REVIEW+=("$name contains localhost/127.0.0.1: inside the container that is the container itself; use host.docker.internal for services on the host.")
+      fi ;;
+  esac
+
+  [[ -n "${ENVMAP[$name]+x}" ]] || ENV_ORDER+=("$name")
+  ENVMAP[$name]="$value"
+done < "$ENV_RAW"
+
 {
   echo "N8N_IMAGE_TAG=$N8N_VERSION"
-  echo "N8N_ENCRYPTION_KEY=$ENC_KEY"
-  grep -E '^(N8N_|DB_|NODES_|NODE_|CODE_|WORKFLOWS_|GENERIC_|EXTERNAL_|WEBHOOK_URL|TZ|EXECUTIONS_|QUEUE_|VUE_APP_)' "$ENV_RAW" \
-    | grep -Ev '^(N8N_ENCRYPTION_KEY|N8N_USER_FOLDER|N8N_IMAGE_TAG|NODE_PATH)=' || true
+  echo "N8N_ENCRYPTION_KEY='${ENC_KEY//\'/\\\'}'"
+  for name in "${ENV_ORDER[@]}"; do
+    v="${ENVMAP[$name]}"
+    # single quotes: Compose then does not interpolate $ in values (passwords etc.)
+    echo "${name}='${v//\'/\\\'}'"
+  done
 } > "$TARGET_DIR/.env"
-
-# Rewrite loopback Postgres host for the container
-if [[ "$DB_TYPE" == "postgresdb" ]]; then
-  sed -i -E 's/^(DB_POSTGRESDB_HOST)=(localhost|127\.0\.0\.1|::1)$/\1=host.docker.internal/' "$TARGET_DIR/.env"
-fi
 chmod 600 "$TARGET_DIR/.env"
+
+echo "Carried over ${#ENV_ORDER[@]} variable(s) from the service:"
+printf '  %s\n' "${ENV_ORDER[@]}"   # names only, never values
+if (( ${#REVIEW[@]} )); then
+  echo
+  echo "REVIEW these (also saved to $BACKUP_DIR/review.txt):"
+  printf '  - %s\n' "${REVIEW[@]}" | tee "$BACKUP_DIR/review.txt"
+  echo
+fi
+
+# Port handling: the container listens on N8N_PORT; publish it on the same host
+# port by default so reverse proxies / bookmarks keep working.
+CONTAINER_PORT="${ENVMAP[N8N_PORT]:-5678}"
+HOST_PORT="${HOST_PORT:-$CONTAINER_PORT}"
+BIND_PREFIX=""
+[[ -n "${BIND_ADDR:-}" ]] && BIND_PREFIX="${BIND_ADDR}:"
+
+VOLUME_LINES="      - ./n8n_data:/home/node/.n8n"
+for v in "${EXTRA_VOLUMES[@]}"; do VOLUME_LINES+=$'\n'"      - $v"; done
 
 cat > "$TARGET_DIR/docker-compose.yml" <<EOF
 services:
@@ -205,12 +284,17 @@ services:
     container_name: n8n
     restart: unless-stopped
     ports:
-      - "${HOST_PORT}:5678"
+      - "${BIND_PREFIX}${HOST_PORT}:${CONTAINER_PORT}"
     env_file: .env
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./n8n_data:/home/node/.n8n
+${VOLUME_LINES}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 EOF
 
 ############################
