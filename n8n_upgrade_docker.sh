@@ -58,8 +58,25 @@ wait_healthy() {
   return 1
 }
 
-apply_images() {  # pull or build for the tag currently in .env
-  if uses_build; then docker compose build --pull; else docker compose pull; fi
+# Pull or build for the tag currently in .env. Skips registry access when the
+# base image is already local, and retries (registries rate-limit with HTTP 429).
+have_base() { docker image inspect "$IMAGE:$(env_get N8N_IMAGE_TAG)" >/dev/null 2>&1; }
+
+apply_images() {
+  local tries=0 delay=30
+  while :; do
+    if uses_build; then
+      if have_base; then docker compose build && return 0
+      else docker compose build --pull && return 0; fi
+    else
+      have_base && return 0
+      docker compose pull && return 0
+    fi
+    tries=$((tries + 1))
+    (( tries >= 3 )) && return 1
+    echo "Attempt $tries failed (registry rate limit?). Retrying in ${delay}s..."
+    sleep "$delay"; delay=$((delay * 2))
+  done
 }
 
 # Restore config + data from a backup dir and start the old version.
@@ -131,6 +148,8 @@ if [[ "$ARG" == "latest" ]]; then
   NEW="$(docker run --rm --entrypoint n8n "$IMAGE:latest" --version 2>/dev/null | tr -d '[:space:]' || true)"
   [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || { echo "ERROR: could not determine the latest version automatically. Pass an explicit VERSION."; exit 1; }
+  # Tag the image we just pulled with its version so later steps need no registry access
+  docker tag "$IMAGE:latest" "$IMAGE:$NEW"
 else
   NEW="${ARG#v}"
   [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ERROR: VERSION must look like 2.48.0 (got '$ARG')."; exit 1; }
@@ -163,7 +182,8 @@ echo "Preparing new image..."
 cp .env "$BACKUP_DIR/.env.pre"   # temp copy so we can restore .env if the pull fails
 sed -i -E "s/^N8N_IMAGE_TAG=.*/N8N_IMAGE_TAG=$NEW/" .env
 if ! apply_images; then
-  echo "ERROR: could not pull/build $NEW (does that tag exist?). Nothing was changed."
+  echo "ERROR: could not pull/build $NEW. Common causes: the tag does not exist, or the registry"
+  echo "       rate-limited you (HTTP 429) - wait a few minutes and re-run. Nothing was changed."
   cp -f "$BACKUP_DIR/.env.pre" .env; rm -f "$BACKUP_DIR/.env.pre"
   exit 1
 fi
