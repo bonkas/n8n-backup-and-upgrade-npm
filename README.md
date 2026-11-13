@@ -8,6 +8,27 @@ A bash script that automates the backup and upgrade process for [n8n](https://n8
 > `n8n_migrate_to_docker.sh` ([details below](#migrating-to-docker-n8n-30)) to move an existing npm/systemd
 > install to Docker Compose, then `n8n_upgrade_docker.sh` ([details below](#upgrading-a-docker-deployment)) for upgrades.
 
+## Python and Script (Execute Command) nodes don't work in n8n 2.x / Docker - how to fix
+
+**Symptoms:** the *Execute Command* node shows as unknown/unavailable, or a command fails with
+`/bin/sh: .../python3: not found` or `Permission denied`. Three separate causes, three fixes:
+
+1. **The node is disabled by default.** n8n 2.0 disables *Execute Command* and *Local File Trigger*
+   ([v2.0 breaking changes](https://docs.n8n.io/changelog/v20-breaking-changes)). Re-enable them:
+   ```bash
+   echo "NODES_EXCLUDE='[]'" | sudo tee -a /opt/n8n/.env
+   cd /opt/n8n && sudo docker compose up -d --force-recreate
+   ```
+2. **Python isn't in the Docker image.** The official image has no Python and no package manager, and host paths such
+   as `/opt/n8n-python` don't exist inside the container. Build Python into a custom image with the example in
+   [`docker/`](docker/) - see [Optional: extra tools in the image](#optional-extra-tools-in-the-image-eg-python).
+3. **The script isn't visible or readable in the container.** Mount it under `/home/node` and make it readable by
+   uid 1000 - see the [step-by-step checklist, permissions and troubleshooting table](#running-a-script-eg-python-from-a-workflow---checklist).
+
+Remember that the node runs **inside the container**: use container paths in the command, e.g.
+`/opt/n8n-python/bin/python3 /home/node/.n8n-files/scripts/python/my_script.py`. After every n8n upgrade, rebuild the
+image: `docker compose up -d --build`.
+
 ## Why This Script?
 
 Upgrading n8n installed via npm can be error-prone. Common issues include:
@@ -301,7 +322,8 @@ paths (e.g. Execute Command nodes) will need those mounted or baked into a custo
 
 ### Execute Command node
 
-n8n 2.x disables the Execute Command node by default. If your workflows use it, add this to
+n8n 2.0 disables the Execute Command and Local File Trigger nodes by default
+([v2.0 breaking changes](https://docs.n8n.io/changelog/v20-breaking-changes)). If your workflows use them, add this to
 `/opt/n8n/.env` and recreate the container (a container only reads `.env` when created):
 
 ```bash
@@ -357,6 +379,73 @@ and make the files readable by uid 1000: `sudo chmod -R a+rX /root/.n8n-files` (
 
 Apply with `sudo docker compose up -d --build`. After changing `N8N_IMAGE_TAG` for an upgrade, run the same command so the
 image is rebuilt on the new version.
+
+### Running a script (e.g. Python) from a workflow - checklist
+
+An Execute Command node runs inside the container, so five things must all be true. Work through them in order:
+
+1. **The node is enabled.** `NODES_EXCLUDE='[]'` in `/opt/n8n/.env`, then
+   `docker compose up -d --force-recreate` (see [Execute Command node](#execute-command-node)).
+2. **The interpreter exists in the image.** The stock image has no Python. Build one in with the example under
+   `docker/`, and call it by its full path in the node (e.g. `/opt/n8n-python/bin/python3`). Extra pip packages go in
+   `docker/requirements-n8n-python.txt` (copied to `/opt/n8n/requirements-n8n-python.txt`), then
+   `docker compose up -d --build`.
+3. **The script is mounted into the container.** Add a bind mount in `docker-compose.yml` that maps a host folder to a
+   path under `/home/node` (not `/root`):
+   ```yaml
+       volumes:
+         - ./n8n_data:/home/node/.n8n
+         - /host/path/to/files:/home/node/.n8n-files
+   ```
+4. **The container user can read it.** See [Permissions](#permissions-for-scripts) below.
+5. **The node uses the container paths**, not host paths:
+   ```
+   /opt/n8n-python/bin/python3 /home/node/.n8n-files/scripts/python/my_script.py
+   ```
+
+Anything the script needs besides itself (config files, tokens, output folders, other host paths) must also be
+mounted, and any network service it calls on the host is reached as `host.docker.internal`, not `localhost`.
+
+#### Permissions for scripts
+
+The container runs as the unprivileged `node` user (**uid/gid 1000**), whatever user owns the files on the host.
+Bind mounts show host ownership and mode unchanged, so uid 1000 needs access:
+
+```bash
+# See ownership/mode as the container sees it (-n = numeric ids)
+sudo docker exec n8n ls -ln /home/node/.n8n-files/scripts
+
+# Read-only scripts: let everyone read, and traverse directories
+sudo chmod -R a+rX /host/path/to/files
+
+# Scripts that write (output, cache, state files): give uid 1000 ownership of what they write to
+sudo chown -R 1000:1000 /host/path/to/files/output
+```
+
+- Running an interpreter against a script (`python3 script.py`) only needs **read** access to the script; the
+  executable bit is only needed if the node runs the script directly (`./script.sh`).
+- Mount under `/home/node`: `/root` inside the image is mode 700, so a mount below it fails with `Permission denied`
+  whatever the host permissions are.
+- On SELinux hosts (RHEL, Fedora) add `:z` to the volume (`/host/path:/home/node/.n8n-files:z`).
+- Read/Write Files nodes are restricted to `/home/node/.n8n-files` by default (`N8N_RESTRICT_FILE_ACCESS_TO`
+  changes this). Execute Command is not restricted.
+
+#### Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| Node shows as unknown / not available | Execute Command is disabled: step 1 |
+| `/bin/sh: /path/python3: not found` | Interpreter not in the image: step 2 (host paths don't exist in the container) |
+| `can't open file ...: [Errno 2] No such file` | Script not mounted, or the node uses the host path: steps 3 and 5 |
+| `Permission denied` on the script | uid 1000 can't read it, or it's mounted under `/root`: step 4 |
+| `ModuleNotFoundError` | Package missing from `requirements-n8n-python.txt`; add it and rebuild |
+| Worked before an upgrade, not after | Image not rebuilt: run `docker compose up -d --build` after changing `N8N_IMAGE_TAG` |
+
+To test outside n8n, run the exact command inside the container:
+
+```bash
+sudo docker exec n8n /opt/n8n-python/bin/python3 /home/node/.n8n-files/scripts/python/my_script.py
+```
 
 ### Rollback
 
