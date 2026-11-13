@@ -298,6 +298,65 @@ The data folder is auto-detected (override with `DATA_DIR=/path/to/.n8n`). Note 
 runs as the unprivileged `node` user (uid 1000) rather than root, and workflows that call host binaries or
 paths (e.g. Execute Command nodes) will need those mounted or baked into a custom image.
 
+### Execute Command node
+
+n8n 2.x disables the Execute Command node by default. If your workflows use it, add this to
+`/opt/n8n/.env` and recreate the container (a container only reads `.env` when created):
+
+```bash
+echo "NODES_EXCLUDE='[]'" | sudo tee -a /opt/n8n/.env
+cd /opt/n8n && sudo docker compose up -d --force-recreate
+```
+
+A malformed `NODES_EXCLUDE` in the old unit (e.g. `[ExecuteCommand]` - it must be a JSON array of full node types such as
+`["n8n-nodes-base.executeCommand"]`) is dropped by the script, so n8n's default applies.
+
+Commands run **inside the container** as the unprivileged `node` user, so host binaries, scripts and paths are not
+available (see the next section).
+
+### Optional: extra tools in the image (e.g. Python)
+
+The official n8n image is a Docker Hardened Image (Alpine): no package manager and no Python. Anything an Execute
+Command node needs (Python, extra CLIs) must be built into a custom image. This is workflow-specific, so the
+migration script does not do it. `docker/` contains an **example** that adds a Python venv at `/opt/n8n-python`
+(so existing `/opt/n8n-python/bin/python3 script.py` commands keep working):
+
+- `docker/Dockerfile.n8n-python` - builds Python with `uv` in a throwaway stage and copies it onto the n8n image
+- `docker/requirements-n8n-python.txt` - pip packages for the venv
+
+> Status: verified working on n8n 2.47.3 (Python 3.13, one pure-Python package). Packages with compiled
+> extensions are not tested against this image - build and test before relying on it.
+
+```bash
+cd /opt/n8n
+sudo cp /path/to/repo/docker/* .
+sudo docker build -f Dockerfile.n8n-python -t n8n-python:$(grep ^N8N_IMAGE_TAG .env | cut -d= -f2) .
+sudo docker run --rm --entrypoint /opt/n8n-python/bin/python3 n8n-python:<tag> -c "import epicstore_api; print('ok')"
+```
+
+Then in `docker-compose.yml` replace the `image:` line with a build section and add a mount for your scripts:
+
+```yaml
+    build:
+      context: .
+      dockerfile: Dockerfile.n8n-python
+      args:
+        N8N_VERSION: ${N8N_IMAGE_TAG}
+    image: n8n-python:${N8N_IMAGE_TAG}
+    volumes:
+      - ./n8n_data:/home/node/.n8n
+      - /root/.n8n-files:/home/node/.n8n-files   # scripts the workflow runs
+```
+
+**Mount scripts under `/home/node`, not `/root`.** The container runs as the unprivileged `node` user (uid 1000) and
+`/root` inside the image is mode 700, so a mount under `/root` fails with `Permission denied` whatever the host
+permissions are. `/home/node/.n8n-files` is also n8n's default folder for the Read/Write Files nodes. Update the paths in
+your Execute Command nodes to match (e.g. `/opt/n8n-python/bin/python3 /home/node/.n8n-files/scripts/python/script.py`),
+and make the files readable by uid 1000: `sudo chmod -R a+rX /root/.n8n-files` (add `chown -R 1000:1000` if scripts write).
+
+Apply with `sudo docker compose up -d --build`. After changing `N8N_IMAGE_TAG` for an upgrade, run the same command so the
+image is rebuilt on the new version.
+
 ### Rollback
 
 ```bash

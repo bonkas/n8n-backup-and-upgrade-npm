@@ -1,0 +1,30 @@
+# n8n + Python venv for Execute Command nodes.
+#
+# The official n8n image is a Docker Hardened Image (Alpine): no apk, no Python.
+# So Python is built in a throwaway stage with uv (self-contained, relocatable
+# Python) and copied in, keeping the host path /opt/n8n-python so existing
+# workflows ("/opt/n8n-python/bin/python3 script.py") work unchanged.
+#
+# Build args:
+#   N8N_VERSION     n8n image tag (must match N8N_IMAGE_TAG in .env)
+#   PYTHON_VERSION  Python to install (match your old venv: /opt/n8n-python/bin/python3 --version)
+#
+# Add more pip packages to requirements-n8n-python.txt (one per line).
+
+ARG N8N_VERSION=2.47.3
+
+FROM ghcr.io/astral-sh/uv:alpine AS pybuild
+ARG PYTHON_VERSION=3.13
+ENV UV_PYTHON_INSTALL_DIR=/opt/python \
+    UV_PYTHON_PREFERENCE=only-managed \
+    UV_LINK_MODE=copy
+COPY requirements-n8n-python.txt /tmp/requirements.txt
+RUN uv python install "${PYTHON_VERSION}" \
+ && uv venv --python "${PYTHON_VERSION}" /opt/n8n-python \
+ && uv pip install --python /opt/n8n-python/bin/python -r /tmp/requirements.txt
+
+FROM docker.n8n.io/n8nio/n8n:${N8N_VERSION}
+# The venv's python3 is a symlink into /opt/python, so both must be copied
+# to the same absolute paths.
+COPY --from=pybuild /opt/python /opt/python
+COPY --from=pybuild /opt/n8n-python /opt/n8n-python
