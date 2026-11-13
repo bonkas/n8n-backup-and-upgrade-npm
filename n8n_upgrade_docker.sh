@@ -95,7 +95,8 @@ restore_from() {
   tar xzf "$dir/n8n-data.tar.gz" -C "$TARGET_DIR"
   chown -R 1000:1000 "$TARGET_DIR/n8n_data"
   echo "Starting restored version $(env_get N8N_IMAGE_TAG)..."
-  if uses_build; then docker compose up -d --build; else docker compose up -d; fi
+  # No --build: compose builds only if the image is missing, so no registry check when it already exists
+  docker compose up -d || true
   if wait_healthy; then
     echo "SUCCESS: rolled back to $(env_get N8N_IMAGE_TAG) and healthy."
   else
@@ -162,7 +163,15 @@ echo "===== n8n Docker upgrade started $(date) ====="
 echo "Current: $CURRENT   Target: $NEW"
 
 if [[ "$CURRENT" == "$NEW" ]]; then
-  echo "Already on $NEW. Nothing to do."; exit 0
+  if docker ps --format '{{.Names}}' | grep -qx n8n; then
+    echo "Already on $NEW and n8n is running. Nothing to do."; exit 0
+  fi
+  echo ".env already says $NEW but n8n is not running (interrupted upgrade?). Starting it..."
+  if docker compose up -d && wait_healthy; then
+    echo "SUCCESS: n8n is healthy on $NEW."; exit 0
+  fi
+  echo "ERROR: n8n did not become healthy. Logs: docker compose -f $TARGET_DIR/docker-compose.yml logs --tail 100 n8n"
+  exit 1
 fi
 
 CUR_MAJOR="${CURRENT%%.*}"; NEW_MAJOR="${NEW%%.*}"
@@ -200,9 +209,10 @@ echo "Backup: $BACKUP_DIR"
 
 echo "Switching to $NEW and starting..."
 sed -i -E "s/^N8N_IMAGE_TAG=.*/N8N_IMAGE_TAG=$NEW/" .env
-if uses_build; then docker compose up -d --build; else docker compose up -d; fi
-
-if wait_healthy; then
+# The image was already pulled/built above, so start WITHOUT --build (a second
+# build re-queries the registry and can fail on rate limits). A start failure
+# falls through to the rollback offer instead of aborting under 'set -e'.
+if docker compose up -d && wait_healthy; then
   RUNNING="$(docker exec n8n n8n --version 2>/dev/null | tr -d '[:space:]' || true)"
   echo "SUCCESS: n8n is healthy (running: ${RUNNING:-unknown}, requested: $NEW)."
   echo "Log in and check workflows, credentials and webhooks."
@@ -212,7 +222,7 @@ if wait_healthy; then
   exit 0
 fi
 
-echo "ERROR: n8n did not become healthy on $NEW."
+echo "ERROR: n8n did not start or become healthy on $NEW."
 echo "Logs: docker compose -f $TARGET_DIR/docker-compose.yml logs --tail 100 n8n"
 if confirm "Roll back to $CURRENT (config and data) now?"; then
   restore_from "$BACKUP_DIR"
