@@ -4,8 +4,9 @@ A bash script that automates the backup and upgrade process for [n8n](https://n8
 
 > **n8n 3.0 notice:** n8n 3.0 drops npm as a supported install method (see the
 > [v3.0 breaking changes](https://docs.n8n.io/changelog/v30-breaking-changes)), so the npm
-> upgrade script stops being useful at 2.x. Use `n8n_migrate_to_docker.sh`
-> ([details below](#migrating-to-docker-n8n-30)) to move an existing npm/systemd install to Docker Compose.
+> upgrade script (`n8n_upgrade_latest.sh`) is **legacy** and stops being useful at 2.x. Use
+> `n8n_migrate_to_docker.sh` ([details below](#migrating-to-docker-n8n-30)) to move an existing npm/systemd
+> install to Docker Compose, then `n8n_upgrade_docker.sh` ([details below](#upgrading-a-docker-deployment)) for upgrades.
 
 ## Why This Script?
 
@@ -385,6 +386,53 @@ Things that can't work unchanged in a container are adjusted or listed in a **RE
 | Value contains `localhost` / `127.0.0.1` | Flagged - use `host.docker.internal` for host services |
 
 The generated `docker-compose.yml` also rotates container logs (10 MB x 3).
+
+## Upgrading a Docker deployment
+
+`n8n_upgrade_docker.sh` upgrades (or rolls back) a deployment created by `n8n_migrate_to_docker.sh`
+(default `/opt/n8n`, override with `TARGET_DIR`). It has the same role as the legacy npm script.
+
+```bash
+sudo ./n8n_upgrade_docker.sh 2.48.0                       # a specific version
+sudo ./n8n_upgrade_docker.sh latest                       # newest image tag
+sudo ./n8n_upgrade_docker.sh --rollback 20261113-120000   # restore a backup
+./n8n_upgrade_docker.sh --help
+```
+
+> Status: syntax-checked only; not yet run against a live server. Test on a snapshot first.
+
+### What it does
+
+1. Reads the current version from `N8N_IMAGE_TAG` in `.env`
+2. Warns and asks for confirmation on a **major** version jump (e.g. 2.x -> 3.x) and links the breaking-changes
+   page; refuses to go to an older version (use `--rollback`)
+3. Pulls (or rebuilds, if the Compose file has a `build:` section such as the custom Python image) the new image
+   **before** stopping n8n, so a non-existent tag causes no downtime
+4. Stops n8n and backs up `n8n_data`, `.env`, `docker-compose.yml` and any `Dockerfile*` / `requirements*.txt` to
+   `./n8n_backup/docker-<timestamp>/` (stopped first so the SQLite file is consistent)
+5. Sets the new `N8N_IMAGE_TAG`, starts n8n and health-checks `/healthz`
+6. On failure, offers to roll back config **and data** (newer versions migrate the database, so the old version may
+   not run on migrated data)
+
+`latest` pulls `:latest` and reads the version with `n8n --version` inside it; if that can't be determined it asks
+for an explicit version.
+
+Variables: `TARGET_DIR` (default `/opt/n8n`), `ASSUME_YES=1` (skip prompts and roll back automatically on failure).
+
+### Rollback
+
+```bash
+ls ./n8n_backup/            # docker-<timestamp> folders
+sudo ./n8n_upgrade_docker.sh --rollback <TIMESTAMP>
+```
+
+This **replaces** the current `n8n_data` with the backup, so anything done in n8n after the upgrade is lost.
+
+### Housekeeping
+
+- Old images stay on disk; reclaim space with `docker image prune`
+- Backups contain credentials - store them securely and delete old ones
+- After an upgrade, check workflows, credentials, webhooks and any Execute Command nodes
 
 ## Security Considerations
 
